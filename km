@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# vim:fileencoding=UTF-8:noet:ts=4:sts=4:sw=4:tw=0:ff=unix
+
+'''
+author: kehlarn
+
+had previous hack versions for 20 years - finally decided to merge them all
+still acl filters to be written and such but better than nothing.
+
+originally came from...
+	sed -n '$d;5,$p' google-fucking-hell |tr ' ' '\n'|perl -Mlib=$HOME/local/perl/base/lib/x86_64-linux-gnu/perl/5.26.1/ -we 'use Socket;use Data::Dumper;use Net::Patricia;my $t=new Net::Patricia;while(<>){chomp;my($n,$m)=split /\//;my $p=unpack("N",Socket::inet_aton($n))&(~((2**(32-$m))-1));if(!$t->match_string($p)){$t->add_string($_,$_)}else{print "ejected $_\n"}}$t->climb_inorder(sub {print $_[0],"\n"})'
+
+>>> bin(struct.unpack("!I",socket.inet_aton("127.0.0.1"))[0])
+'0b1111111000000000000000000000001'
+'''
+
+import radix
+import argparse
+import os
+import sys
+import contextlib
+import functools
+import itertools
+import re
+import ipaddress
+
+class metric(object):
+	distal=proximal=folds=passes=duplicate=after=0
+
+class runner(object):
+	def __init__(self,av):
+		self.version=(1,0,16)
+		self.parser=argparse.ArgumentParser(description='kehlarn prefix mapper')
+		sp=self.parser.add_subparsers(title='commands',dest='command')
+		optlist=[
+		[	['-i','--include'],
+			{'action':'append','type':str,'nargs':1,'help':'only these','metavar':'<cidr>','default':[]}],
+		[ 	['-x','--exclude'],
+			{'action':'append','type':str,'nargs':1,'help':'all but these','metavar':'<cidr>','default':[]}],
+		[ 	['-I','--infile'],
+			{'action':'append','type':str,'nargs':1,'help':'file for inclusion cidrs','metavar':'<cidrfile>','default':[]}],
+		[ 	['-X','--exfile'],
+			{'action':'append','type':str,'nargs':1,'help':'file for exclusion cidrs','metavar':'<cidrfile>','default':[]}],
+		[ 	['-r','--rpsl'],
+			{'action':'store_true','default':False,'dest':'rpsl','help':'allow rpsl wide lines'}],
+		[ 	['-z','--polarity'],
+			{'action':'store_false','default':True,'dest':'dir','help':'reverse polarity (include then exclude)'}],
+		[ 	['-v','--invert'],
+			{'action':'store_true','default':False,'dest':'invert','help':'invert matching rules'}],
+		[ 	['-d','--debug'],
+			{'action':'store_true','default':False,'dest':'debug','help':'guess'}],
+		[ 	['-D','--duplicate'],
+			{'action':'store_true','default':False,'dest':'dup','help':'guess'}],
+		[	['-V','--version'],
+			{'action':'version','version':'%(prog)s {}.{}.{} by kehlarn'.format(*self.version)}],
+		]
+		for optp,optkw in optlist:
+			self.parser.add_argument(*optp,**optkw)
+
+		#the following inanity is so the verb can be before OR after options
+		#because default argparse wants options before subcommands only
+		#makes sense for global vs verb specific but we want to allow either
+		#as the syntax for sub opts reads more naturally and behaves like getopt
+		cmd=[]
+		cmd.append(sp.add_parser('fold',help='produce a folded selection (minimal spanning set)'))
+		for optp,optkw in optlist:
+			cmd[-1].add_argument(*optp,**optkw)
+
+		cmd.append(sp.add_parser('acl',help='produce a specific acl from selection'))
+		cmd[-1].add_argument('-a','--acl',
+			type=str,dest='aclname',help='acl name',metavar='<aclname>',default=self.genericname())
+		for optp,optkw in optlist:
+			cmd[-1].add_argument(*optp,**optkw)
+
+		cmd.append(sp.add_parser('stat',help='statistics for folding operation'))
+		for optp,optkw in optlist:
+			cmd[-1].add_argument(*optp,**optkw)
+
+		cmd.append(sp.add_parser('grep',help='grep like text search with cidr filtering'))
+		for optp,optkw in optlist:
+			cmd[-1].add_argument(*optp,**optkw)
+		cmd[-1].add_argument('-q','--quiet',
+			action='store_true',default=False,dest='quiet',help='no output just return code')
+		cmd[-1].add_argument('-H','--showfile',
+			action='store_true',default=False,dest='showfile',help='preface file name')
+		cmd[-1].add_argument('-n','--withline',
+			action='store_true',default=False,dest='showline',help='preface line number')
+
+		self.context,self.target=self.parser.parse_known_args(av[1:])
+		#we're using append since extend isn't until 3.8 so we manually flatten here
+		for k in ('include','exclude','infile','exfile'):
+			setattr(self.context,k,list(itertools.chain(*getattr(self.context,k))))
+		self.rc=3		#should never see this. leak if so
+	@contextlib.contextmanager
+	def source(self,t=None):
+		if not t or t=='-':
+			yield sys.stdin
+		else:
+			with open(t,'r') as s:
+				yield s
+	def gprint(self,fn,ln=None,*a,**kw):
+		if self.context.command=='grep':
+			if self.context.showfile:
+				print(fn,end=':')
+			if self.context.showline:
+				if ln:
+					print(ln,end=':')
+				else:
+					print('?',end=':')
+		print(*a,**kw)
+	def slurp(self,ds):
+		r=[]
+		for line in ds:
+			if any([self.context.rpsl and line[0] not in ('A','C'),not self.context.rpsl]):
+				r.extend(line.split())
+		return r
+	def bail(self,e):
+		if self.context.command=='grep' and not self.context.quiet:
+			print(': '.join([self.context.command,e.filename,e.strerror]),file=sys.stderr)
+		self.rc=2
+		return self.rc
+	def sieve(self,p=(),pf=(),st=None):
+		def addst(s,t,u):
+			if '/' not in t:
+				print('invalid range filter/not a prefix:',t,file=sys.stderr)
+				return False
+			if u:
+				try:
+					k=s.search_exact(t)
+				except (ValueError,) as e:
+					return False
+				else:
+					if k:
+						if self.context.dup:
+							print('duplicate:',t,file=sys.stderr)
+						u.duplicate+=1
+					else:
+						s.add(t)
+			else:
+				try:
+					s.add(t)
+				except (ValueError) as e:
+					print('invalid address:',t,file=sys.stderr)
+					return False
+			return True
+		r=radix.Radix()
+		for x in p:
+			if not addst(r,x,st):
+				return None
+		for x in pf:
+			try:
+				with self.source(x) as data:
+					for t in self.slurp(data):
+						if not addst(r,t,st):
+							return None
+			except (FileNotFoundError,IndexError) as e:
+				self.bail(e)
+				r=None
+		return r
+	def run(self):
+		self.filteri=self.sieve(self.context.include,self.context.infile)
+		self.filterx=self.sieve(self.context.exclude,self.context.exfile)
+		if all([self.filteri,self.filterx]):
+			return self.route()
+		else:
+			print('could not load filters cleanly. did you forget --rpsl?')
+		return self.rc
+	def genericname(self):
+		return 'acl{}'.format(
+			''.join([chr(ord('0')+x%(ord('9')-ord('0'))) for x in os.getrandom(6)])
+			)
+	def convolve(self,a,b):
+		''' stats untouched for the time being '''
+		r=radix.Radix()
+		[r.add(x.prefix) for x in a]
+		fset=[self.filterx,self.filteri]
+		faction=[False,True]
+		if not self.context.dir:
+			fset.reverse()
+			faction.reverse()
+		if self.context.invert:
+			faction=[not x for x in faction]
+		for ki,kernel in enumerate(fset):
+			if faction[ki]:
+				for retain in kernel:
+					for p in a.search_covered(retain.prefix):
+						r.add(p.prefix)
+				if self.context.debug:
+					print('len+',len(a.prefixes()),len(r.prefixes()),self.filteri.prefixes())
+			else:
+				for cull in kernel:
+					for p in r.search_covered(cull.prefix):
+						r.delete(p.prefix)
+				if self.context.debug:
+					print('len-',len(a.prefixes()),len(r.prefixes()),self.filterx.prefixes())
+		return r
+	def route(self):
+		if not len(self.target):
+			self.parser.print_help(sys.stderr)
+			return 2
+		for fn in self.target:
+			if self.context.command in ('fold','stat','acl'):
+				st=metric()
+				s=self.sieve((),(fn,),st)
+				if not s:
+					print('possible garbage in "{}"; did you forget --rpsl?'.format(fn))
+					return 2
+				t=self.reduce(s,st)		#aggregates only
+				u=self.decimate(t,st)	#merge adjacent prefixes
+				v=self.convolve(u,st)	#apply filters
+				if self.context.command=='stat':
+					print('warning - filters ignored for now')	#convolve takes stat (b) but doesnt process, yet
+					print('before:\t',st.distal+st.proximal)
+					print('distal:\t',st.distal)
+					print('prox:\t',st.proximal)
+					print('folds:\t',st.folds)
+					print('passes:\t',st.passes)
+					print('dup:\t',st.duplicate)
+					print('after:\t',st.after)
+				elif self.context.command=='acl':
+					return self.genacl(v,'mikrotik',self.context.aclname)
+				else:
+					for p in v:
+						print(p.prefix)
+				return 0
+			elif self.context.command=='grep':
+				weakip=r'((?:[0-9A-Fa-f:]+)(?:[0-9\.]+)?(?:%\S+?)?|[0-9\.]+)'
+				#weakip=r'((?:\d+\.){3}\d+|[0-9A-Fa-f]{1,4}::|::[0-9A-Fa-f]{1,4}|:[0-9A-Fa-f]{1,4}:)'
+				scan=re.compile(weakip)
+				try:
+					with self.source(fn) as data:
+						for lineno,line in enumerate(data):
+							line=line.rstrip()
+							printed=False
+							for token in line.split():
+								for pos in scan.finditer(token):
+									try:
+										addr=str(ipaddress.ip_address(pos.group(1)))
+									except (ValueError):
+										pass
+									else:
+										if self.context.debug:
+											print('trying token',addr)
+										if self.filteri.search_covering(addr) and not self.filterx.search_covering(addr):
+											self.gprint(fn,lineno,line)
+				except (FileNotFoundError,IndexError) as e:
+					return self.bail(e)
+			else:
+				if self.context.command:
+					print('error: unknown command verb:',self.context.command,file=sys.stderr)
+				else:
+					print('error: missing command verb',file=sys.stderr)
+				self.parser.print_help(sys.stderr)
+				return 2
+	def reduce(self,s,st):
+		''' produce subset with aggregates only and no specifics '''
+		t=radix.Radix()
+		for node in s:
+			k=s.search_worst(node.prefix)
+			if k.prefix==node.prefix:
+				st.proximal+=1
+				t.add(k.prefix)
+			else:
+				st.distal+=1
+		return t
+	def decimate(self,s,st):
+		''' walk the remainder, reduce the mask length by one and compare. if
+		they match then these two can be merged '''
+		done=False
+		#stopgap code. do NOT want to pull entire prefix list to eval
+		#TODO: radix internals for walking tree
+		#also so doesnt require creating new radix tree
+		while not done:
+			folded=0
+			t=radix.Radix()
+			allpre=s.prefixes()
+			i=0
+			while i<len(allpre)-1:
+				k=radix.Radix()
+				a,b=allpre[i].split('/')
+				c,d=allpre[i+1].split('/')
+				x=k.add(a,int(b)-1)
+				y=k.add(c,int(d)-1)
+				if x.prefix==y.prefix: #merge
+					t.add(x.prefix)
+					folded+=1
+					i+=2
+				else:		#left
+					t.add(allpre[i])
+					i+=1
+			if i<len(allpre): #right
+				t.add(allpre[i])
+			s=t
+			if folded==0:
+				done=True
+			st.passes+=1
+			st.folds+=folded
+		st.after=len(allpre)
+		return s
+	def genacl(self,t,mode,aclname):
+		if mode=='mikrotik':
+			print('/ip firewall address-list remove [find list={}]'.format(aclname))
+			fa='/ip firewall address-list add list={1} address={0}'
+			for p in t:
+				print(fa.format(p.prefix,aclname))
+			return 0
+		else:
+			pass #stub for now on other modes
+			return 4
+if __name__=='__main__':
+	sys.exit(runner(sys.argv).run())
