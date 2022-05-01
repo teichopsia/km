@@ -23,6 +23,7 @@ import functools
 import itertools
 import re
 import ipaddress
+import operator
 
 class metric(object):
 	distal=proximal=folds=passes=duplicate=after=0
@@ -241,7 +242,12 @@ class runner(object):
 									else:
 										if self.context.debug:
 											print('trying token',addr)
-										if self.filteri.search_covering(addr) and not self.filterx.search_covering(addr):
+										allow=[self.filteri.search_covering(addr),not self.filterx.search_covering(addr)]
+										if self.context.invert:
+											oper=operator.not_
+										else:
+											oper=operator.eq
+										if oper(all(allow)):
 											self.gprint(fn,lineno,line)
 				except (FileNotFoundError,IndexError) as e:
 					return self.bail(e)
@@ -308,4 +314,10 @@ class runner(object):
 			pass #stub for now on other modes
 			return 4
 if __name__=='__main__':
-	sys.exit(runner(sys.argv).run())
+	if os.geteuid()==os.getuid() and os.getuid():
+		try:
+			sys.exit(runner(sys.argv).run())
+		except (BrokenPipeError) as e:
+			pass
+	else:
+		print('stop running as root')
