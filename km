@@ -23,7 +23,6 @@ import functools
 import itertools
 import re
 import ipaddress
-import operator
 
 class metric(object):
 	distal=proximal=folds=passes=duplicate=after=0
@@ -244,10 +243,8 @@ class runner(object):
 											print('trying token',addr)
 										allow=[self.filteri.search_covering(addr),not self.filterx.search_covering(addr)]
 										if self.context.invert:
-											oper=operator.not_
-										else:
-											oper=operator.eq
-										if oper(all(allow)):
+											allow=list(map(lambda x:not x,allow))
+										if all(allow):
 											self.gprint(fn,lineno,line)
 				except (FileNotFoundError,IndexError) as e:
 					return self.bail(e)
