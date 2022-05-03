@@ -314,7 +314,7 @@ if __name__=='__main__':
 	if os.geteuid()==os.getuid() and os.getuid():
 		try:
 			sys.exit(runner(sys.argv).run())
-		except (BrokenPipeError) as e:
+		except (BrokenPipeError,KeyboardInterrupt) as e:
 			pass
 	else:
 		print('stop running as root')
