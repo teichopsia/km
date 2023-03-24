@@ -177,7 +177,7 @@ class runner(object):
 		return self.rc
 	def genericname(self):
 		return 'acl{}'.format(
-			''.join([chr(ord('0')+x%(ord('9')-ord('0'))) for x in os.getrandom(6)])
+			''.join([chr(ord('0')+x%(ord('9')-ord('0'))) for x in os.urandom(6)])
 			)
 	def convolve(self,a,b):
 		''' stats untouched for the time being '''
